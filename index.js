@@ -23,6 +23,7 @@ const STREAM_LABELS = {
 
 const STATIC_PREFIXES = ["/libs", "/js", "/css", "/img", "/socket.io"];
 
+// ✅ Detect the public-facing host dynamically from the request
 function getPublicHost(req) {
   const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
   const host  = req.headers["x-forwarded-host"]  || req.headers["host"] || "localhost:10000";
@@ -49,12 +50,14 @@ for (const [name, target] of Object.entries(STREAMS)) {
     on: {
       proxyRes: responseInterceptor(async (responseBuffer, proxyRes, req, res) => {
 
+        // ── Detect real public host for this request ──────────────────────
         const { proto, host, base } = getPublicHost(req);
 
         // ── Fix redirect Location headers ─────────────────────────────────
         if (proxyRes.headers["location"]) {
           let loc = proxyRes.headers["location"];
           loc = loc.replace(target, "");
+          // Replace any localhost reference in redirect
           loc = loc.replace(/https?:\/\/localhost:\d+/g, base);
           if (!loc.startsWith(`/${name}`)) loc = `/${name}${loc}`;
           res.setHeader("location", loc);
@@ -72,12 +75,23 @@ for (const [name, target] of Object.entries(STREAMS)) {
         ) {
           let manifest = responseBuffer.toString("utf8");
 
+          // Replace full origin URLs
           manifest = manifest.replace(
             new RegExp(target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
             `${base}/${name}`
           );
-          manifest = manifest.replace(/https?:\/\/localhost:\d+/g, base);
-          manifest = manifest.replace(/^\/(?![A-Za-z]+\/)/gm, `/${name}/`);
+
+          // Replace any leftover localhost URLs
+          manifest = manifest.replace(
+            /https?:\/\/localhost:\d+/g,
+            `${base}`
+          );
+
+          // Rewrite root-relative paths /token/... → /Name/token/...
+          manifest = manifest.replace(
+            /^\/(?![A-Za-z]+\/)/gm,
+            `/${name}/`
+          );
 
           console.log(`[${name}] Rewrote .m3u8 manifest`);
           res.setHeader("content-type", "application/vnd.apple.mpegurl");
@@ -88,12 +102,17 @@ for (const [name, target] of Object.entries(STREAMS)) {
 
         let html = responseBuffer.toString("utf8");
 
-        // ── Replace hardcoded localhost URLs ──────────────────────────────
-        html = html.replace(/https?:\/\/localhost:\d+/g, base);
-        html = html.replace(
-          new RegExp(target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
-          `${base}/${name}`
+        // ── ✅ KEY FIX: Replace ALL hardcoded localhost URLs in HTML ───────
+        // This covers HLS src URLs, socket.io URLs, fetch() calls, etc.
+        const localhostPattern = /https?:\/\/localhost:\d+/g;
+        html = html.replace(localhostPattern, base);
+
+        // Also replace bare origin IP:port references
+        const originPattern = new RegExp(
+          target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+          "g"
         );
+        html = html.replace(originPattern, `${base}/${name}`);
 
         // ── Fix static asset paths ────────────────────────────────────────
         STATIC_PREFIXES.forEach(prefix => {
@@ -107,11 +126,26 @@ for (const [name, target] of Object.entries(STREAMS)) {
           );
         });
 
-        // ── Fix socket.io ─────────────────────────────────────────────────
-        html = html.replace(/io\s*\(\s*\)/g,               `io("${base}", { path: "/${name}/socket.io" })`);
-        html = html.replace(/io\s*\(\s*["']\/["']\s*\)/g,  `io("${base}", { path: "/${name}/socket.io" })`);
-        html = html.replace(/io\s*\(\s*["']https?:\/\/[^"']+["']/g, `io("${base}", { path: "/${name}/socket.io" }`);
-        html = html.replace(/io\s*\(\s*\{/g,               `io("${base}", {`);
+        // ── Fix socket.io connection to use correct host + path ───────────
+        // Replace io() / io('/') with correct proxy host and path
+        html = html.replace(
+          /io\s*\(\s*\)/g,
+          `io("${base}", { path: "/${name}/socket.io" })`
+        );
+        html = html.replace(
+          /io\s*\(\s*["']\/["']\s*\)/g,
+          `io("${base}", { path: "/${name}/socket.io" })`
+        );
+        // Catch io("http://...") patterns and rewrite host
+        html = html.replace(
+          /io\s*\(\s*["']https?:\/\/[^"']+["']/g,
+          `io("${base}", { path: "/${name}/socket.io" }`
+        );
+        // Catch io({ ... }) object style
+        html = html.replace(
+          /io\s*\(\s*\{/g,
+          `io("${base}", {`
+        );
 
         // ── Fix <video> tags ──────────────────────────────────────────────
         html = html.replace(/<video([^>]*)>/gi, (match, attrs) => {
@@ -121,66 +155,20 @@ for (const [name, target] of Object.entries(STREAMS)) {
           return `<video${attrs}>`;
         });
 
-        // ── ✅ Fix viewport meta — replace or inject correct one ──────────
-        // Remove any existing viewport meta that might have wrong values
-        html = html.replace(
-          /<meta[^>]*name=["']viewport["'][^>]*>/gi,
-          ""
-        );
-
-        // ── ✅ Build the full injection block ─────────────────────────────
-        const injectedHead = `
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<style>
-  /* ✅ Force full-size layout — fixes zoom-out on deployed/live */
-  html, body {
-    width: 100% !important;
-    height: 100% !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    overflow: hidden !important;
-    background: #000 !important;
-  }
-  /* Force video and player containers to fill viewport */
-  video,
-  .player,
-  .video-container,
-  .video-wrapper,
-  #player,
-  #video,
-  #videoContainer,
-  [id*="player"],
-  [class*="player"],
-  [class*="video"] {
-    width: 100% !important;
-    height: 100% !important;
-    max-width: 100% !important;
-    max-height: 100% !important;
-    position: relative !important;
-    display: block !important;
-  }
-  /* Remove any fixed pixel dimensions that cause shrinking */
-  [style*="width: 640"],
-  [style*="width: 480"],
-  [style*="width: 320"],
-  [style*="height: 360"],
-  [style*="height: 240"] {
-    width: 100% !important;
-    height: 100% !important;
-  }
-</style>
+        // ── Inject autoplay + dynamic base URL fix script ─────────────────
+        const injectedScript = `
 <script>
 (function() {
-  // ✅ Rewrite XHR URLs from localhost to real host
+  // ✅ Override XMLHttpRequest to rewrite any localhost URLs on the fly
   var _open = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url) {
     if (typeof url === 'string') {
       url = url.replace(/https?:\\/\\/localhost:\\d+/g, window.location.origin);
     }
-    return _open.apply(this, [method, url].concat(Array.prototype.slice.call(arguments, 2)));
+    return _open.apply(this, arguments);
   };
 
-  // ✅ Rewrite fetch() URLs from localhost to real host
+  // ✅ Override fetch() to rewrite localhost URLs
   var _fetch = window.fetch;
   window.fetch = function(input, init) {
     if (typeof input === 'string') {
@@ -189,7 +177,7 @@ for (const [name, target] of Object.entries(STREAMS)) {
     return _fetch.call(this, input, init);
   };
 
-  // ✅ Autoplay fix — mute first, unmute on interaction
+  // ✅ Autoplay fix
   function fixAutoplay() {
     document.querySelectorAll('video, audio').forEach(function(media) {
       if (!media._autoplayFixed) {
@@ -211,34 +199,14 @@ for (const [name, target] of Object.entries(STREAMS)) {
     });
   }
 
-  // ✅ Fix zoom — force all fixed-pixel sized elements to 100%
-  function fixLayout() {
-    document.querySelectorAll('*').forEach(function(el) {
-      var style = el.getAttribute('style') || '';
-      // Replace inline width/height pixel values that cause shrinking
-      if (/width\s*:\s*\d+(px)?/.test(style) || /height\s*:\s*\d+(px)?/.test(style)) {
-        var tag = el.tagName.toLowerCase();
-        if (['video','div','section','main','article','body','html'].includes(tag)) {
-          el.style.width  = '100%';
-          el.style.height = '100%';
-        }
-      }
-    });
-  }
-
-  document.addEventListener('DOMContentLoaded', function() {
-    fixAutoplay();
-    fixLayout();
-  });
+  fixAutoplay();
 
   var observer = new MutationObserver(function(mutations) {
     mutations.forEach(function(m) {
       m.addedNodes.forEach(function(node) {
-        if (!node || !node.tagName) return;
+        if (!node) return;
         if (node.tagName === 'VIDEO' || node.tagName === 'AUDIO') fixAutoplay();
-        if (node.querySelectorAll) {
-          node.querySelectorAll('video, audio').forEach(function() { fixAutoplay(); });
-        }
+        if (node.querySelectorAll) node.querySelectorAll('video, audio').forEach(function() { fixAutoplay(); });
       });
     });
   });
@@ -248,20 +216,19 @@ for (const [name, target] of Object.entries(STREAMS)) {
   } else {
     document.addEventListener('DOMContentLoaded', function() {
       observer.observe(document.body, { childList: true, subtree: true });
+      fixAutoplay();
     });
   }
 })();
 </script>`;
 
-        // ── Inject right after <head> — before any other styles load ──────
+        // Inject as early as possible — right after <head> or <body> open
         if (html.includes("<head>")) {
-          html = html.replace("<head>", "<head>" + injectedHead);
-        } else if (/<head\s[^>]*>/i.test(html)) {
-          html = html.replace(/<head\s[^>]*>/i, (m) => m + injectedHead);
+          html = html.replace("<head>", "<head>" + injectedScript);
         } else if (html.includes("<body")) {
-          html = html.replace(/<body[^>]*>/i, (m) => m + injectedHead);
+          html = html.replace(/<body[^>]*>/, (m) => m + injectedScript);
         } else {
-          html = injectedHead + html;
+          html = injectedScript + html;
         }
 
         return html;
@@ -343,7 +310,6 @@ app.get("/", (req, res) => {
 <html>
 <head>
   <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Live Streams</title>
   <style>
     body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }

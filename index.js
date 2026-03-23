@@ -2,68 +2,71 @@ const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 
 const app = express();
-const PORT = process.env.PORT || 10000;
 
-// 🔥 Track active stream
-let currentTarget = "http://43.241.131.66:8081"; // default Devi
+// 🔥 store stream in cookie
+app.use((req, res, next) => {
+  if (req.url.startsWith("/Devi")) {
+    res.setHeader("Set-Cookie", "stream=Devi");
+  } else if (req.url.startsWith("/Vithoba")) {
+    res.setHeader("Set-Cookie", "stream=Vithoba");
+  } else if (req.url.startsWith("/Bhuvaneshwari")) {
+    res.setHeader("Set-Cookie", "stream=Bhuvaneshwari");
+  }
+  next();
+});
 
-function proxy(basePath, target) {
-  return createProxyMiddleware({
-    target: target,
-    changeOrigin: true,
-    ws: true,
-    secure: false,
+// 🔥 FIX STATIC PATHS
+app.use((req, res, next) => {
+  if (
+    req.url.startsWith("/libs") ||
+    req.url.startsWith("/js") ||
+    req.url.startsWith("/css") ||
+    req.url.startsWith("/img") ||
+    req.url.startsWith("/socket.io")
+  ) {
+    const cookie = req.headers.cookie || "";
 
-    onProxyReq: (proxyReq, req) => {
-      proxyReq.setHeader("Referer", target);
-      proxyReq.setHeader("Origin", target);
-    },
-
-    pathRewrite: {
-      [`^${basePath}`]: ""
+    if (cookie.includes("stream=Bhuvaneshwari")) {
+      req.url = "/Bhuvaneshwari" + req.url;
+    } else if (cookie.includes("stream=Devi")) {
+      req.url = "/Devi" + req.url;
+    } else if (cookie.includes("stream=Vithoba")) {
+      req.url = "/Vithoba" + req.url;
     }
-  });
-}
-
-// 🔥 MAIN ROUTES
-
-app.use("/Devi", (req, res, next) => {
-  currentTarget = "http://43.241.131.66:8081";
-  proxy("/Devi", currentTarget)(req, res, next);
+  }
+  next();
 });
 
-app.use("/Vithoba", (req, res, next) => {
-  currentTarget = "http://43.241.131.66:8080";
-  proxy("/Vithoba", currentTarget)(req, res, next);
+// 🔥 PROXIES (CREATE ONCE)
+const deviProxy = createProxyMiddleware({
+  target: "http://43.241.131.66:8081",
+  changeOrigin: true,
+  ws: true,
+  pathRewrite: { "^/Devi": "" }
 });
 
-app.use("/Bhuvaneshwari", (req, res, next) => {
-  currentTarget = "http://43.241.131.66:8082";
-  proxy("/Bhuvaneshwari", currentTarget)(req, res, next);
+const vithobaProxy = createProxyMiddleware({
+  target: "http://43.241.131.66:8080",
+  changeOrigin: true,
+  ws: true,
+  pathRewrite: { "^/Vithoba": "" }
 });
 
-// 🔥 CRITICAL FIX (STATIC FILES → DYNAMIC TARGET)
-app.use([
-  "/libs",
-  "/js",
-  "/css",
-  "/img",
-  "/hls",
-  "/socket.io"
-], (req, res, next) => {
-  createProxyMiddleware({
-    target: currentTarget,
-    changeOrigin: true,
-    ws: true,
-    secure: false
-  })(req, res, next);
+const bhuvanProxy = createProxyMiddleware({
+  target: "http://43.241.131.66:8082",
+  changeOrigin: true,
+  ws: true,
+  pathRewrite: { "^/Bhuvaneshwari": "" }
 });
+
+// ROUTES
+app.use("/Devi", deviProxy);
+app.use("/Vithoba", vithobaProxy);
+app.use("/Bhuvaneshwari", bhuvanProxy);
 
 // ROOT
 app.get("/", (req, res) => {
   res.send("✅ Proxy Running FINAL");
 });
 
-app.listen(PORT, () => {
-  console.log("🚀 Running on port " + PORT);
-});
+app.listen(process.env.PORT || 10000);

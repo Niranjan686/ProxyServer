@@ -9,10 +9,29 @@ const STREAMS = {
   Bhuvaneshwari: "http://43.241.131.66:8082",
 };
 
+const STREAM_PATHS = {
+  Devi:          "/61UrPpOUxPHPb9W7vaJf1RpEPxuy4h/embed/0QJSB5iAZO/laxminarayan/jquery%7Cfullscreen%7Cgui",
+  Vithoba:       "/igQfNYjeKgtRjXMBX6hdHmHA3W6oeo/embed/nALDhzrwbk/vithalrukmani/jquery%7Cfullscreen%7Cgui",
+  Bhuvaneshwari: "/zuCYpPJQlYDtFw24aEBM5p2TboVg1N/embed/LzdXCGlmjH/bhuvaneshwari/jquery%7Cfullscreen%7Cgui",
+};
+
+const STREAM_LABELS = {
+  Devi:          "Laxmi Narayan",
+  Vithoba:       "Vithal Rukmani",
+  Bhuvaneshwari: "Bhuvaneshwari",
+};
+
 const STATIC_PREFIXES = ["/libs", "/js", "/css", "/img", "/socket.io"];
 
+// ✅ Detect the public-facing host dynamically from the request
+function getPublicHost(req) {
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
+  const host  = req.headers["x-forwarded-host"]  || req.headers["host"] || "localhost:10000";
+  return { proto, host, base: `${proto}://${host}` };
+}
+
 const httpProxyMap = {};
-const wsProxyMap = {};
+const wsProxyMap   = {};
 
 for (const [name, target] of Object.entries(STREAMS)) {
 
@@ -31,10 +50,15 @@ for (const [name, target] of Object.entries(STREAMS)) {
     on: {
       proxyRes: responseInterceptor(async (responseBuffer, proxyRes, req, res) => {
 
-        // Fix redirect Location headers
+        // ── Detect real public host for this request ──────────────────────
+        const { proto, host, base } = getPublicHost(req);
+
+        // ── Fix redirect Location headers ─────────────────────────────────
         if (proxyRes.headers["location"]) {
           let loc = proxyRes.headers["location"];
           loc = loc.replace(target, "");
+          // Replace any localhost reference in redirect
+          loc = loc.replace(/https?:\/\/localhost:\d+/g, base);
           if (!loc.startsWith(`/${name}`)) loc = `/${name}${loc}`;
           res.setHeader("location", loc);
           console.log(`[${name}] redirect → ${loc}`);
@@ -42,7 +66,7 @@ for (const [name, target] of Object.entries(STREAMS)) {
 
         const contentType = proxyRes.headers["content-type"] || "";
 
-        // ✅ Rewrite HLS .m3u8 manifests
+        // ── Rewrite HLS .m3u8 manifests ───────────────────────────────────
         if (
           contentType.includes("application/vnd.apple.mpegurl") ||
           contentType.includes("application/x-mpegurl") ||
@@ -51,16 +75,22 @@ for (const [name, target] of Object.entries(STREAMS)) {
         ) {
           let manifest = responseBuffer.toString("utf8");
 
-          // Rewrite full URLs pointing to origin
+          // Replace full origin URLs
           manifest = manifest.replace(
             new RegExp(target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
-            `/${name}`
+            `${base}/${name}`
           );
 
-          // Rewrite root-relative paths like /token/hls/... → /Name/token/hls/...
+          // Replace any leftover localhost URLs
           manifest = manifest.replace(
-            /^(\/)(?!${name}\/?)([^\r\n]+)/gm,
-            `/${name}/$2`
+            /https?:\/\/localhost:\d+/g,
+            `${base}`
+          );
+
+          // Rewrite root-relative paths /token/... → /Name/token/...
+          manifest = manifest.replace(
+            /^\/(?![A-Za-z]+\/)/gm,
+            `/${name}/`
           );
 
           console.log(`[${name}] Rewrote .m3u8 manifest`);
@@ -72,54 +102,90 @@ for (const [name, target] of Object.entries(STREAMS)) {
 
         let html = responseBuffer.toString("utf8");
 
-        // Fix static asset paths
+        // ── ✅ KEY FIX: Replace ALL hardcoded localhost URLs in HTML ───────
+        // This covers HLS src URLs, socket.io URLs, fetch() calls, etc.
+        const localhostPattern = /https?:\/\/localhost:\d+/g;
+        html = html.replace(localhostPattern, base);
+
+        // Also replace bare origin IP:port references
+        const originPattern = new RegExp(
+          target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+          "g"
+        );
+        html = html.replace(originPattern, `${base}/${name}`);
+
+        // ── Fix static asset paths ────────────────────────────────────────
         STATIC_PREFIXES.forEach(prefix => {
           html = html.replace(
-            new RegExp(`(src|href|action)=(["'])(${prefix})`, "g"),
+            new RegExp(`(src|href|action)=(["'])(${prefix.replace("/", "\\/")})`, "g"),
             `$1=$2/${name}$3`
           );
           html = html.replace(
-            new RegExp(`url\\((['"])(${prefix})`, "g"),
+            new RegExp(`url\\((['"])(${prefix.replace("/", "\\/")})`, "g"),
             `url($1/${name}$2`
           );
         });
 
-        // Fix socket.io path
+        // ── Fix socket.io connection to use correct host + path ───────────
+        // Replace io() / io('/') with correct proxy host and path
         html = html.replace(
           /io\s*\(\s*\)/g,
-          `io({ path: "/${name}/socket.io" })`
+          `io("${base}", { path: "/${name}/socket.io" })`
         );
         html = html.replace(
           /io\s*\(\s*["']\/["']\s*\)/g,
-          `io({ path: "/${name}/socket.io" })`
+          `io("${base}", { path: "/${name}/socket.io" })`
         );
-
-        // Fix <video> tags — add muted, autoplay, playsinline
+        // Catch io("http://...") patterns and rewrite host
         html = html.replace(
-          /<video([^>]*)>/gi,
-          (match, attrs) => {
-            if (!attrs.includes("muted"))      attrs += " muted";
-            if (!attrs.includes("autoplay"))   attrs += " autoplay";
-            if (!attrs.includes("playsinline")) attrs += " playsinline";
-            return `<video${attrs}>`;
-          }
+          /io\s*\(\s*["']https?:\/\/[^"']+["']/g,
+          `io("${base}", { path: "/${name}/socket.io" }`
+        );
+        // Catch io({ ... }) object style
+        html = html.replace(
+          /io\s*\(\s*\{/g,
+          `io("${base}", {`
         );
 
-        // ✅ Inject autoplay fix script before </body>
-        const autoplayScript = `
+        // ── Fix <video> tags ──────────────────────────────────────────────
+        html = html.replace(/<video([^>]*)>/gi, (match, attrs) => {
+          if (!attrs.includes("muted"))       attrs += " muted";
+          if (!attrs.includes("autoplay"))    attrs += " autoplay";
+          if (!attrs.includes("playsinline")) attrs += " playsinline";
+          return `<video${attrs}>`;
+        });
+
+        // ── Inject autoplay + dynamic base URL fix script ─────────────────
+        const injectedScript = `
 <script>
 (function() {
+  // ✅ Override XMLHttpRequest to rewrite any localhost URLs on the fly
+  var _open = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url) {
+    if (typeof url === 'string') {
+      url = url.replace(/https?:\\/\\/localhost:\\d+/g, window.location.origin);
+    }
+    return _open.apply(this, arguments);
+  };
+
+  // ✅ Override fetch() to rewrite localhost URLs
+  var _fetch = window.fetch;
+  window.fetch = function(input, init) {
+    if (typeof input === 'string') {
+      input = input.replace(/https?:\\/\\/localhost:\\d+/g, window.location.origin);
+    }
+    return _fetch.call(this, input, init);
+  };
+
+  // ✅ Autoplay fix
   function fixAutoplay() {
     document.querySelectorAll('video, audio').forEach(function(media) {
       if (!media._autoplayFixed) {
         media._autoplayFixed = true;
         media.muted = true;
         var p = media.play();
-        if (p && p.catch) {
-          p.catch(function() {});
-        }
+        if (p && p.catch) p.catch(function() {});
 
-        // Unmute on first user interaction
         var unmute = function() {
           media.muted = false;
           document.removeEventListener('click', unmute);
@@ -133,22 +199,14 @@ for (const [name, target] of Object.entries(STREAMS)) {
     });
   }
 
-  // Run immediately
   fixAutoplay();
 
-  // Watch for dynamically added video/audio elements (HLS players add these late)
   var observer = new MutationObserver(function(mutations) {
     mutations.forEach(function(m) {
       m.addedNodes.forEach(function(node) {
         if (!node) return;
-        if (node.tagName === 'VIDEO' || node.tagName === 'AUDIO') {
-          fixAutoplay();
-        }
-        if (node.querySelectorAll) {
-          node.querySelectorAll('video, audio').forEach(function() {
-            fixAutoplay();
-          });
-        }
+        if (node.tagName === 'VIDEO' || node.tagName === 'AUDIO') fixAutoplay();
+        if (node.querySelectorAll) node.querySelectorAll('video, audio').forEach(function() { fixAutoplay(); });
       });
     });
   });
@@ -164,11 +222,13 @@ for (const [name, target] of Object.entries(STREAMS)) {
 })();
 </script>`;
 
-        html = html.replace(/<\/body>/i, autoplayScript + "</body>");
-
-        // If no </body> found, append at end
-        if (!html.includes(autoplayScript)) {
-          html += autoplayScript;
+        // Inject as early as possible — right after <head> or <body> open
+        if (html.includes("<head>")) {
+          html = html.replace("<head>", "<head>" + injectedScript);
+        } else if (html.includes("<body")) {
+          html = html.replace(/<body[^>]*>/, (m) => m + injectedScript);
+        } else {
+          html = injectedScript + html;
         }
 
         return html;
@@ -176,7 +236,7 @@ for (const [name, target] of Object.entries(STREAMS)) {
 
       error: (err, req, res) => {
         console.error(`[${name}] Error:`, err.message);
-        if (res?.writeHead) { res.writeHead(502); res.end(`Bad Gateway`); }
+        if (res?.writeHead) { res.writeHead(502); res.end("Bad Gateway"); }
       },
     },
   });
@@ -193,7 +253,7 @@ for (const [name, target] of Object.entries(STREAMS)) {
   });
 }
 
-// ✅ HLS/asset requests WITHOUT stream prefix — detect via Referer and reroute
+// ── HLS/asset requests WITHOUT stream prefix — detect via Referer ─────────────
 app.use((req, res, next) => {
   const alreadyPrefixed = Object.keys(STREAMS).some(s =>
     req.url.toLowerCase().startsWith(`/${s.toLowerCase()}`)
@@ -201,7 +261,7 @@ app.use((req, res, next) => {
   if (alreadyPrefixed) return next();
 
   const referer = req.headers["referer"] || "";
-  const stream = Object.keys(STREAMS).find(s =>
+  const stream  = Object.keys(STREAMS).find(s =>
     referer.toLowerCase().includes(`/${s.toLowerCase()}`)
   );
 
@@ -214,18 +274,18 @@ app.use((req, res, next) => {
   next();
 });
 
-// Stream routes
+// ── Stream routes ─────────────────────────────────────────────────────────────
 for (const [name, proxy] of Object.entries(httpProxyMap)) {
   app.use(`/${name}`, proxy);
 }
 
-// Static assets via Referer
+// ── Static assets via Referer ─────────────────────────────────────────────────
 app.use((req, res, next) => {
   const isStatic = STATIC_PREFIXES.some(p => req.url.startsWith(p));
   if (!isStatic) return next();
 
   const referer = req.headers["referer"] || "";
-  const stream = Object.keys(STREAMS).find(s =>
+  const stream  = Object.keys(STREAMS).find(s =>
     referer.toLowerCase().includes(`/${s.toLowerCase()}`)
   );
   if (!stream) return res.status(404).send("Unknown stream context");
@@ -234,36 +294,61 @@ app.use((req, res, next) => {
   httpProxyMap[stream](req, res, next);
 });
 
-// Home page
-app.get("/", (_req, res) => {
-  res.send(`
-    <h2>Streams</h2>
-    <ul>
-      <li><a href="/Devi/61UrPpOUxPHPb9W7vaJf1RpEPxuy4h/embed/0QJSB5iAZO/laxminarayan/jquery%7Cfullscreen%7Cgui">Laxmi Narayan</a></li>
-      <li><a href="/Vithoba/igQfNYjeKgtRjXMBX6hdHmHA3W6oeo/embed/nALDhzrwbk/vithalrukmani/jquery%7Cfullscreen%7Cgui">Vithal Rukmani</a></li>
-      <li><a href="/Bhuvaneshwari/zuCYpPJQlYDtFw24aEBM5p2TboVg1N/embed/LzdXCGlmjH/bhuvaneshwari/jquery%7Cfullscreen%7Cgui">Bhuvaneshwari</a></li>
-    </ul>
-  `);
+// ── Home page ─────────────────────────────────────────────────────────────────
+app.get("/", (req, res) => {
+  const { base } = getPublicHost(req);
+
+  const links = Object.entries(STREAM_PATHS)
+    .map(([name, path]) => `
+      <li>
+        <a href="${base}/${name}${path}">${STREAM_LABELS[name]}</a>
+        <br/><small style="color:#888">${base}/${name}${path}</small>
+      </li>`)
+    .join("");
+
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Live Streams</title>
+  <style>
+    body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+    ul { list-style: none; padding: 0; }
+    li { margin: 16px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px; }
+    a { font-size: 18px; font-weight: bold; color: #0070f3; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    small { font-size: 12px; word-break: break-all; }
+    .info { background:#f5f5f5; padding:12px; border-radius:6px; margin-top:24px; font-size:13px; }
+  </style>
+</head>
+<body>
+  <h2>🔴 Live Streams</h2>
+  <ul>${links}</ul>
+  <div class="info">
+    <strong>Server Info</strong><br/>
+    Base URL: <code>${base}</code><br/>
+    Port: <code>${process.env.PORT || 10000}</code><br/>
+    Env: <code>${process.env.NODE_ENV || "development"}</code>
+  </div>
+</body>
+</html>`);
 });
 
-const server = app.listen(process.env.PORT || 10000, () => {
-  console.log(`✅ Proxy running on port ${process.env.PORT || 10000}`);
-  console.log(`
-  Open:
-  http://localhost:10000/Devi/61UrPpOUxPHPb9W7vaJf1RpEPxuy4h/embed/0QJSB5iAZO/laxminarayan/jquery%7Cfullscreen%7Cgui
-  http://localhost:10000/Vithoba/igQfNYjeKgtRjXMBX6hdHmHA3W6oeo/embed/nALDhzrwbk/vithalrukmani/jquery%7Cfullscreen%7Cgui
-  http://localhost:10000/Bhuvaneshwari/zuCYpPJQlYDtFw24aEBM5p2TboVg1N/embed/LzdXCGlmjH/bhuvaneshwari/jquery%7Cfullscreen%7Cgui
-  `);
+// ── Start server ──────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 10000;
+const server = app.listen(PORT, () => {
+  console.log(`✅ Proxy running on port ${PORT}`);
+  console.log(`   Streams: ${Object.keys(STREAMS).join(", ")}`);
 });
 
-// WebSocket upgrade handling
+// ── WebSocket upgrade ─────────────────────────────────────────────────────────
 server.on("upgrade", (req, socket, head) => {
   const urlStream = Object.keys(STREAMS).find(s =>
     req.url.toLowerCase().startsWith(`/${s.toLowerCase()}`)
   );
   if (urlStream) return wsProxyMap[urlStream].upgrade(req, socket, head);
 
-  const origin = req.headers["origin"] || req.headers["referer"] || "";
+  const origin    = req.headers["origin"] || req.headers["referer"] || "";
   const refStream = Object.keys(STREAMS).find(s =>
     origin.toLowerCase().includes(`/${s.toLowerCase()}`)
   );
